@@ -97,7 +97,8 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="cloud",
             errors=errors,
-            data_schema=schema
+            data_schema=schema,
+            last_step=False
         )
 
     async def async_step_ip_method(self, user_input=None, errors={}):
@@ -131,7 +132,8 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="ask_ip",
             errors=errors,
-            data_schema=schema
+            data_schema=schema,
+            last_step=False
         )
 
     async def async_step_pre_scan(self, user_input=None, errors={}):
@@ -141,7 +143,8 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="pre_scan",
             errors=errors,
-            data_schema=vol.Schema({})
+            data_schema=vol.Schema({}),
+            last_step=False
         )
 
     async def async_step_scan(self, user_input=None):
@@ -188,7 +191,8 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="scan",
             errors=errors,
-            data_schema=schema
+            data_schema=schema,
+            last_step=False
         )
 
     def _test_connection(self, dev_id, address, local_key, version):

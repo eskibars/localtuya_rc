@@ -3,6 +3,7 @@ import logging
 import asyncio
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
+import tinytuya
 from tinytuya import Contrib
 from tinytuya.Contrib import RFRemoteControlDevice
 import threading
@@ -63,15 +64,15 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass, entry, async_add_entities, discovery_info=None):
     """Set up the Tuya IR Remote Control entry."""
-    await async_setup_platform(hass, entry.data, async_add_entities, discovery_info)
+    await async_setup_platform(hass, entry.data, async_add_entities, discovery_info, entry=entry)
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None, entry=None):
     """Set up platform."""
     if config == None:
         _LOGGER.error("Configuration is empty")
         return
-    
+
     name = config.get(CONF_NAME, DEFAULT_FRIENDLY_NAME)
     dev_id = config.get(CONF_DEVICE_ID)
     host = config.get(CONF_HOST)
@@ -86,7 +87,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     _LOGGER.debug("Setting up Tuya IR Remote Control: name=%s, dev_id=%s, host=%s, local_key=%s, protocol_version=%s, persistent_connection=%s, cloud_info=%s", name, dev_id, host, local_key, protocol_version, persistent_connection, cloud_info)
 
-    remote = TuyaRC(name, dev_id, host, local_key, protocol_version, persistent_connection, cloud_info)
+    remote = TuyaRC(name, dev_id, host, local_key, protocol_version, persistent_connection, cloud_info, hass=hass, entry=entry)
     # Update availability of the device
     await hass.async_add_executor_job(remote._update_availibility)
 
@@ -94,7 +95,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class TuyaRC(RemoteEntity):
-    def __init__(self, name, dev_id, address, local_key, protocol_version, persistent_connection=DEFAULT_PERSISTENT_CONNECTION, cloud_info=None):
+    def __init__(self, name, dev_id, address, local_key, protocol_version, persistent_connection=DEFAULT_PERSISTENT_CONNECTION, cloud_info=None, hass=None, entry=None):
         self._name = name
         self._dev_id = dev_id
         self._address = address
@@ -102,7 +103,9 @@ class TuyaRC(RemoteEntity):
         self._protocol_version = protocol_version
         self._persistent_connection = persistent_connection
         self._cloud_info = cloud_info
-        
+        self._hass = hass
+        self._entry = entry
+
         self._storage = None
         self._codes = {}
         self._available = False
@@ -248,6 +251,19 @@ class TuyaRC(RemoteEntity):
         """Turn the device off."""
         raise HomeAssistantError("Turning off is not supported for this device.")
 
+    def _scan_for_device(self):
+        """Scan the network for this device and return its IP if found."""
+        _LOGGER.debug("Scanning network for device %s...", self._dev_id)
+        try:
+            devices = tinytuya.deviceScan()
+            for ip, device in devices.items():
+                if device.get("gwId") == self._dev_id:
+                    _LOGGER.debug("Found device %s at IP %s", self._dev_id, ip)
+                    return ip
+        except Exception as e:
+            _LOGGER.error("Network scan failed: %s", e, exc_info=True)
+        return None
+
     def _update_availibility(self):
         with self._lock:
             _LOGGER.debug("Updating device %s availibility...", self._dev_id)
@@ -263,6 +279,28 @@ class TuyaRC(RemoteEntity):
                 _LOGGER.error("Failed to update device, exception %s: %s", type(e), e, exc_info=True)
             if not self._available:
                 self._deinit()
+                # Try to find the device at a new IP address
+                new_ip = self._scan_for_device()
+                if new_ip and new_ip != self._address:
+                    _LOGGER.info("Device %s found at new IP %s (was %s), updating...", self._dev_id, new_ip, self._address)
+                    self._address = new_ip
+                    # Update the config entry with the new IP (must run on event loop)
+                    if self._hass and self._entry:
+                        updated_data = dict(self._entry.data)
+                        updated_data[CONF_HOST] = new_ip
+                        self._hass.loop.call_soon_threadsafe(
+                            lambda: self._hass.config_entries.async_update_entry(self._entry, data=updated_data)
+                        )
+                    # Try connecting with the new IP
+                    try:
+                        self._init()
+                        status = self._device.status()
+                        self._available = status and not "Error" in status
+                        if not self._available:
+                            self._deinit()
+                    except Exception as e:
+                        _LOGGER.error("Failed to connect to device at new IP %s: %s", new_ip, e)
+                        self._deinit()
             _LOGGER.debug("Device %s is available: %s", self._dev_id, self._available)
 
     async def async_update(self):
