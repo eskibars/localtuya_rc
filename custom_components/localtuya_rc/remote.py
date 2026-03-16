@@ -180,13 +180,27 @@ class TuyaRC(RemoteEntity):
         self._deinit()
 
     def _receive_button(self, timeout):
+        import time
         with self._lock:
             self._init()
-            try:
-                return self._device.receive_button(timeout)
-            except Exception as e:
-                _LOGGER.error("Failed to receive button, exception %s: %s", type(e), e, exc_info=True)
-                raise HomeAssistantError("tinytuya library internal error, please check the logs.")
+            start = time.time()
+            remaining = timeout
+            while remaining > 0:
+                try:
+                    button = self._device.receive_button(remaining)
+                except Exception as e:
+                    _LOGGER.error("Failed to receive button, exception %s: %s", type(e), e, exc_info=True)
+                    raise HomeAssistantError("tinytuya library internal error, please check the logs.")
+                if button is None:
+                    return None  # Timeout
+                if isinstance(button, str):
+                    return button  # Got the IR code
+                if isinstance(button, dict) and "Error" in button:
+                    return button  # Real error from device
+                # Spurious status update (e.g. {'dps': {'1': 'scene'}}), ignore and retry
+                _LOGGER.debug("Ignoring unexpected response during IR learn: %s, retrying with %.1fs remaining...", button, remaining)
+                remaining = timeout - (time.time() - start)
+            return None  # Overall timeout
     
     def _send_button(self, pulses):
         with self._lock:
