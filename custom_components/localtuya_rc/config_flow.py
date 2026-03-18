@@ -34,6 +34,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_DEVICE_ID: '',
             CONF_LOCAL_KEY: '',
             CONF_PROTOCOL_VERSION: 'Auto',
+            CONF_CONTROL_TYPE: CONTROL_TYPE_AUTO,
             CONF_PERSISTENT_CONNECTION: DEFAULT_PERSISTENT_CONNECTION,
             CONF_REGION: 'eu',
             CONF_CLIENT_ID: '',
@@ -168,7 +169,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if len(self.scan_devices) == 0:
                 return await self.async_step_pre_scan(errors={"base": "tuya_not_found"})
             if not self.cloud:
-                ip_list = [f"{ip} ({self.scan_devices[ip]["gwId"]})" for ip in self.scan_devices]
+                ip_list = [f"{ip} ({self.scan_devices[ip]['gwId']})" for ip in self.scan_devices]
             else:
                 ip_list = []
                 for ip in self.scan_devices:
@@ -191,12 +192,36 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=schema
         )
 
-    def _test_connection(self, dev_id, address, local_key, version):
+    def _test_connection(self, dev_id, address, local_key, version, control_type):
         _LOGGER.debug("Testing connection to %s at %s with key %s", dev_id, address, local_key)
-        device = Contrib.IRRemoteControlDevice(dev_id=dev_id, address=address, local_key=local_key, version=version, connection_timeout=5, connection_retry_delay=0.5, connection_retry_limit=2)
-        status = device.status()
-        _LOGGER.debug("Connection test status: %s, control type detected: %s", status, device.control_type)
-        return device, status
+        control_type = normalize_control_type(control_type)
+        kwargs = {
+            "dev_id": dev_id,
+            "address": address,
+            "local_key": local_key,
+            "version": version,
+            "connection_timeout": 5,
+            "connection_retry_delay": 0.5,
+            "connection_retry_limit": 2,
+        }
+        if control_type:
+            kwargs["control_type"] = control_type
+        device = None
+        try:
+            device = Contrib.IRRemoteControlDevice(**kwargs)
+            status = device.status()
+            detected_control_type = (
+                normalize_control_type(device.control_type)
+                or infer_control_type_from_status(status)
+                or control_type
+            )
+            if detected_control_type and not normalize_control_type(device.control_type):
+                device.control_type = detected_control_type
+            _LOGGER.debug("Connection test status: %s, control type detected: %s", status, detected_control_type)
+            return status, detected_control_type
+        finally:
+            if device:
+                device.close()
 
     async def async_step_config(self, user_input=None, errors={}):
         """Last config step"""
@@ -207,23 +232,33 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self.config[CONF_LOCAL_KEY] = user_input[CONF_LOCAL_KEY]
             self.config[CONF_PERSISTENT_CONNECTION] = user_input[CONF_PERSISTENT_CONNECTION]
             self.config[CONF_PROTOCOL_VERSION] = user_input[CONF_PROTOCOL_VERSION]
+            self.config[CONF_CONTROL_TYPE] = user_input[CONF_CONTROL_TYPE]
             # Bruteforce the protocol version (in order of preference)
             try_versions = TUYA_VERSIONS if user_input[CONF_PROTOCOL_VERSION] == "Auto" else [user_input[CONF_PROTOCOL_VERSION]]
             version_ok = None
+            control_type_ok = None
             for version in try_versions:
                 _LOGGER.debug("Trying protocol version %s", version)
                 try:
-                    device, status = await self.hass.async_add_executor_job(self._test_connection, user_input[CONF_DEVICE_ID], user_input[CONF_HOST], user_input[CONF_LOCAL_KEY], version)
+                    status, detected_control_type = await self.hass.async_add_executor_job(
+                        self._test_connection,
+                        user_input[CONF_DEVICE_ID],
+                        user_input[CONF_HOST],
+                        user_input[CONF_LOCAL_KEY],
+                        version,
+                        user_input[CONF_CONTROL_TYPE],
+                    )
                 except Exception as e:
                     _LOGGER.error("Device test error, exception %s: %s", type(e), e, exc_info=True)
                     continue
-                if "Error" not in status:
+                if status and "Error" not in status:
                     version_ok = version
+                    control_type_ok = detected_control_type
                     break
             if not version_ok:
                 errors["base"] = "cannot_connect"
                 _LOGGER.error(f"Cannot connect to device using any protocol version")
-            elif not device.control_type:
+            elif not control_type_ok:
                 errors["base"] = "no_control_type"
                 _LOGGER.error(f"Device test error: control type not detected")
             elif self.config[CONF_DEVICE_ID] in self._async_current_ids():
@@ -231,6 +266,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 # Ok!
                 self.config[CONF_PROTOCOL_VERSION] = version_ok
+                self.config[CONF_CONTROL_TYPE] = serialize_control_type(control_type_ok)
                 if self.cloud and 'key' in self.cloud_info:
                     del self.cloud_info['key'] # to protect the key
                 self.config[CONF_CLOUD_INFO] = self.cloud_info if self.cloud else None
@@ -245,6 +281,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required(CONF_DEVICE_ID, default=self.config[CONF_DEVICE_ID]): cv.string,
             vol.Required(CONF_LOCAL_KEY, default=self.config[CONF_LOCAL_KEY]): cv.string,
             vol.Required(CONF_PROTOCOL_VERSION, default=self.config[CONF_PROTOCOL_VERSION]): vol.In(["Auto"] + versions_sorted),
+            vol.Required(CONF_CONTROL_TYPE, default=self.config.get(CONF_CONTROL_TYPE, CONTROL_TYPE_AUTO)): vol.In(CONTROL_TYPE_OPTIONS),
             vol.Required(CONF_PERSISTENT_CONNECTION, default=self.config[CONF_PERSISTENT_CONNECTION]): cv.boolean
         })
         return self.async_show_form(
@@ -266,12 +303,14 @@ class LocalTuyaIROptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         if user_input is not None:
+            self.config[CONF_CONTROL_TYPE] = user_input[CONF_CONTROL_TYPE]
             self.config[CONF_PERSISTENT_CONNECTION] = user_input[CONF_PERSISTENT_CONNECTION]
             _LOGGER.debug("Config updated: %s", self.config)
             self.hass.config_entries.async_update_entry(self.entry, data=self.config)
             return self.async_create_entry(data=self.config)
 
         options_schema = vol.Schema({
+            vol.Required(CONF_CONTROL_TYPE, default=self.config.get(CONF_CONTROL_TYPE, CONTROL_TYPE_AUTO)): vol.In(CONTROL_TYPE_OPTIONS),
             vol.Required(CONF_PERSISTENT_CONNECTION, default=self.config.get(CONF_PERSISTENT_CONNECTION, DEFAULT_PERSISTENT_CONNECTION)): cv.boolean
         })
 

@@ -13,11 +13,16 @@ from .const import (
     CONF_LOCAL_KEY,
     CONF_PROTOCOL_VERSION,
     CONF_CLOUD_INFO,
+    CONF_CONTROL_TYPE,
     CONF_PERSISTENT_CONNECTION,
     CODE_STORAGE_VERSION,
     CODE_STORAGE_CODES,
     NOTIFICATION_TITLE,
-    DEFAULT_PERSISTENT_CONNECTION
+    DEFAULT_PERSISTENT_CONNECTION,
+    CONTROL_TYPE_AUTO,
+    CONTROL_TYPE_OPTIONS,
+    infer_control_type_from_status,
+    normalize_control_type,
 )
 
 from homeassistant.const import (
@@ -54,6 +59,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
             vol.Required(CONF_PROTOCOL_VERSION, default="3.3"): vol.In(
                 ["3.1", "3.2", "3.3", "3.4", "3.5"]
             ),
+            vol.Required(CONF_CONTROL_TYPE, default=CONTROL_TYPE_AUTO): vol.In(CONTROL_TYPE_OPTIONS),
             vol.Required(CONF_PERSISTENT_CONNECTION, default=DEFAULT_PERSISTENT_CONNECTION): cv.boolean,
     }
 )
@@ -78,6 +84,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     local_key = config.get(CONF_LOCAL_KEY)
     protocol_version = config.get(CONF_PROTOCOL_VERSION)
     cloud_info = config.get(CONF_CLOUD_INFO, None)
+    control_type = normalize_control_type(config.get(CONF_CONTROL_TYPE))
     persistent_connection = config.get(CONF_PERSISTENT_CONNECTION, DEFAULT_PERSISTENT_CONNECTION)
 
     if name is None or host is None or dev_id is None or local_key is None:
@@ -86,7 +93,16 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     _LOGGER.debug("Setting up Tuya IR Remote Control: name=%s, dev_id=%s, host=%s, local_key=%s, protocol_version=%s, persistent_connection=%s, cloud_info=%s", name, dev_id, host, local_key, protocol_version, persistent_connection, cloud_info)
 
-    remote = TuyaRC(name, dev_id, host, local_key, protocol_version, persistent_connection, cloud_info)
+    remote = TuyaRC(
+        name,
+        dev_id,
+        host,
+        local_key,
+        protocol_version,
+        persistent_connection,
+        cloud_info,
+        control_type,
+    )
     # Update availability of the device
     await hass.async_add_executor_job(remote._update_availibility)
 
@@ -94,7 +110,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class TuyaRC(RemoteEntity):
-    def __init__(self, name, dev_id, address, local_key, protocol_version, persistent_connection=DEFAULT_PERSISTENT_CONNECTION, cloud_info=None):
+    def __init__(self, name, dev_id, address, local_key, protocol_version, persistent_connection=DEFAULT_PERSISTENT_CONNECTION, cloud_info=None, control_type=None):
         self._name = name
         self._dev_id = dev_id
         self._address = address
@@ -102,6 +118,7 @@ class TuyaRC(RemoteEntity):
         self._protocol_version = protocol_version
         self._persistent_connection = persistent_connection
         self._cloud_info = cloud_info
+        self._control_type = normalize_control_type(control_type)
         
         self._storage = None
         self._codes = {}
@@ -111,20 +128,109 @@ class TuyaRC(RemoteEntity):
         self._device_RF = None
         self._lock = threading.Lock()
 
+    def _device_kwargs(self):
+        kwargs = {
+            "dev_id": self._dev_id,
+            "address": self._address,
+            "local_key": self._local_key,
+            "version": float(self._protocol_version),
+            "persist": self._persistent_connection,
+        }
+        if self._control_type:
+            kwargs["control_type"] = self._control_type
+        return kwargs
+
+    def _apply_known_control_type(self):
+        if not self._control_type:
+            return
+        if self._device and not normalize_control_type(getattr(self._device, "control_type", None)):
+            self._device.control_type = self._control_type
+        if self._device_RF and hasattr(self._device_RF, "control_type") and not normalize_control_type(getattr(self._device_RF, "control_type", None)):
+            self._device_RF.control_type = self._control_type
+
+    def _cache_control_type(self, control_type, source=None):
+        normalized = normalize_control_type(control_type)
+        if not normalized:
+            return None
+        if normalized != self._control_type:
+            if source:
+                _LOGGER.debug("Using IR control type %s from %s.", normalized, source)
+            else:
+                _LOGGER.debug("Using IR control type %s.", normalized)
+        self._control_type = normalized
+        self._apply_known_control_type()
+        return normalized
+
+    def _refresh_control_type(self, status=None):
+        control_type = self._cache_control_type(getattr(self._device, "control_type", None), "tinytuya")
+        if control_type:
+            return control_type
+        inferred = infer_control_type_from_status(status)
+        if inferred:
+            return self._cache_control_type(inferred, "status response")
+        return self._control_type
+
+    def _ensure_control_type(self):
+        self._init()
+        control_type = self._refresh_control_type()
+        if control_type:
+            return control_type
+
+        try:
+            status = self._device.status()
+        except Exception as e:
+            _LOGGER.debug("Status call failed while determining IR control type for %s: %s", self._dev_id, e, exc_info=True)
+            status = None
+
+        control_type = self._refresh_control_type(status)
+        if control_type:
+            return control_type
+
+        _LOGGER.debug("Reinitializing IR device %s to retry control type detection.", self._dev_id)
+        self._deinit()
+        self._init()
+        try:
+            status = self._device.status()
+        except Exception as e:
+            _LOGGER.debug("Status call failed after reinitializing IR device %s: %s", self._dev_id, e, exc_info=True)
+            status = None
+        return self._refresh_control_type(status)
+
+    def _control_type_error(self):
+        return 'Unable to determine the Tuya IR control type. Try again, restart the device, or set "Control type" manually in the integration options.'
+
     def _init(self):
         if self._device:
+            self._apply_known_control_type()
             return
-        _LOGGER.debug("Initializing device %s (address: %s, local_key: %s, protocol_version: %s, persistent_connection: %s)...", self._dev_id, self._address, self._local_key, self._protocol_version, self._persistent_connection)
-        self._device = Contrib.IRRemoteControlDevice(dev_id=self._dev_id, address=self._address, local_key=self._local_key, version=float(self._protocol_version), persist=self._persistent_connection)
-        _LOGGER.debug("Initializing device %s (address: %s, local_key: %s, protocol_version: %s, persistent_connection: %s)...", self._dev_id, self._address, self._local_key, self._protocol_version, self._persistent_connection)
-        self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(dev_id=self._dev_id, address=self._address, local_key=self._local_key, version=float(self._protocol_version), persist=self._persistent_connection)
-        _LOGGER.debug("Device %s initialized.", self._dev_id)
+        _LOGGER.debug("Initializing IR device %s (address: %s, local_key: %s, protocol_version: %s, persistent_connection: %s, control_type: %s)...", self._dev_id, self._address, self._local_key, self._protocol_version, self._persistent_connection, self._control_type)
+        self._device = Contrib.IRRemoteControlDevice(**self._device_kwargs())
+        self._refresh_control_type()
+        _LOGGER.debug("IR device %s initialized with control_type=%s.", self._dev_id, getattr(self._device, "control_type", None))
+
+    def _init_rf(self):
+        if self._device_RF:
+            self._apply_known_control_type()
+            return
+        _LOGGER.debug("Initializing RF device %s (address: %s, local_key: %s, protocol_version: %s, persistent_connection: %s)...", self._dev_id, self._address, self._local_key, self._protocol_version, self._persistent_connection)
+        self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(
+            dev_id=self._dev_id,
+            address=self._address,
+            local_key=self._local_key,
+            version=float(self._protocol_version),
+            persist=self._persistent_connection,
+        )
+        self._apply_known_control_type()
+        _LOGGER.debug("RF device %s initialized.", self._dev_id)
 
     def _deinit(self):
         if self._device:
             self._device.close()
             self._device = None
-            _LOGGER.debug("Device %s deinitialized.", self._dev_id)
+        if self._device_RF:
+            self._device_RF.close()
+            self._device_RF = None
+        _LOGGER.debug("Device %s deinitialized.", self._dev_id)
 
     @property
     def available(self):
@@ -166,8 +272,9 @@ class TuyaRC(RemoteEntity):
             del extra['icon']
         # Add some extra attributes
         extra['protocol_version'] = self._protocol_version
-        if self._device:
-            extra['control_type'] = self._device.control_type
+        control_type = normalize_control_type(getattr(self._device, "control_type", None)) or self._control_type
+        if control_type:
+            extra['control_type'] = control_type
         extra['learned_commands'] = str({device: str(list(commands.keys())) for device, commands in self._codes.items()})
         return extra
 
@@ -182,7 +289,8 @@ class TuyaRC(RemoteEntity):
     def _receive_button(self, timeout):
         import time
         with self._lock:
-            self._init()
+            if not self._ensure_control_type():
+                return {"Error": self._control_type_error()}
             start = time.time()
             remaining = timeout
             while remaining > 0:
@@ -205,12 +313,13 @@ class TuyaRC(RemoteEntity):
     def _send_button(self, pulses):
         with self._lock:
             try:
-                self._init()
-                if type(pulses) == str:
+                if not self._ensure_control_type():
+                    raise HomeAssistantError(self._control_type_error())
+                if isinstance(pulses, str):
                     _LOGGER.debug("Sending command as base64: '%s'", pulses)
                     try:
                         return self._device.send_button(pulses)
-                    except:
+                    except Exception as e:
                         _LOGGER.error("Failed to send command as base64, exception %s: %s", type(e), e, exc_info=True)
                         raise HomeAssistantError("tinytuya library internal error, please check the logs.")
                 else:
@@ -219,7 +328,7 @@ class TuyaRC(RemoteEntity):
                     _LOGGER.debug("Converted to base64: '%s'", b64)
                     try:
                         return self._device.send_button(b64)
-                    except:
+                    except Exception as e:
                         _LOGGER.error("Failed to send command as pulses, exception %s: %s", type(e), e, exc_info=True)
                         raise HomeAssistantError("tinytuya library internal error, please check the logs.")
             except Exception as e:
@@ -228,7 +337,7 @@ class TuyaRC(RemoteEntity):
     
     def _receive_button_rf(self, timeout):
         with self._lock:
-            self._init()
+            self._init_rf()
             try:
                 return self._device_RF.rf_receive_button(timeout=timeout)
             except Exception as e:
@@ -238,7 +347,7 @@ class TuyaRC(RemoteEntity):
     def _send_button_rf(self, base64):
         with self._lock:
             try:
-                self._init()
+                self._init_rf()
                 try:
                     _LOGGER.debug("Sending command as base64: '%s'", base64)
                     return self._device_RF.rf_send_button(base64)
@@ -268,6 +377,7 @@ class TuyaRC(RemoteEntity):
             try:
                 self._init()
                 status = self._device.status()
+                self._refresh_control_type(status)
                 _LOGGER.debug(f"Device status: {status}")
                 self._available = status and not "Error" in status
                 if not self._available:

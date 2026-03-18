@@ -7,7 +7,7 @@
         },
         "error": {
             "cannot_connect": "Cannot connect to the device. Verify that address, device id, local key and protocol version are correct.",
-            "no_control_type": "Can't detect control type. Maybe the device is not supported, sorry.",
+            "no_control_type": "Can't detect the IR control type automatically. Try selecting it manually.",
             "tuya_not_found": "No Tuya devices found. Make sure that it's online and connected to the same network and try again.",
             "cloud_error": "Error while connecting to the Tuya cloud. Please check your configuration.",
             "cloud_unauthorized": "Unauthorized to access the Tuya cloud. Please check your configuration: API key and API secret.",
@@ -69,6 +69,7 @@
                     "device_id": "Device ID",
                     "local_key": "Local key",
                     "protocol_version": "Protocol version (usually 3.3 or 3.4)",
+                    "control_type": "Control type",
                     "persistent_connection": "Persistent connection (faster but can be unstable)"
                 }
             }
@@ -79,6 +80,7 @@
             "init": {
                 "title": "Configure your Tuya Remote Control device",
                 "data": {
+                    "control_type": "Control type",
                     "persistent_connection": "Persistent connection (faster but can be unstable)"
                 }
             }
